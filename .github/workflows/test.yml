@@ -1,4 +1,10 @@
 name: Test_Change
+
+# The workflow only reads the repository; declaring that explicitly removes the
+# default write-capable GITHUB_TOKEN from every step.
+permissions:
+  contents: read
+
 on:
   pull_request
 jobs:
@@ -6,24 +12,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: file_changes
-        uses: trilom/file-changes-action@ce38c8ce2459ca3c303415eec8cb0409857b4272
+        # Pinned to an immutable commit SHA (v1) so a retagged release cannot
+        # change what executes in CI.
+        uses: trilom/file-changes-action@ce38c8ce2459ca3c303415eec8cb0409857b4272 # v1
         with:
           output: 'json'
           fileOutput: 'json'
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         name: Install pnpm
         with:
           version: 10
           run_install: false
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           cache: 'pnpm'
@@ -39,10 +47,20 @@ jobs:
       - name: Run changes files through test script
         env:
           LLAMA_DEBUG_MODE: "true"
+          # File lists are passed through the environment rather than
+          # interpolated into the shell script: a PR can rename files, and a
+          # crafted filename interpolated with `${{ }}` is a command-injection
+          # sink (CWE-78).
+          FILES_MODIFIED: ${{ steps.file_changes.outputs.files_modified }}
+          FILES_ADDED: ${{ steps.file_changes.outputs.files_added }}
+          # Base/head SHAs are resolved by GitHub, but they are still routed
+          # through the environment for the same reason.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           RUN_FILES=$(
-            MODIFIED=${{ steps.file_changes.outputs.files_modified}} \
-            ADDED=${{ steps.file_changes.outputs.files_added}} \
+            MODIFIED="$FILES_MODIFIED" \
+            ADDED="$FILES_ADDED" \
             node ${{ github.workspace }}/.github/workflows/getFileList.js
           )
 
@@ -54,17 +72,14 @@ jobs:
           # pnpm remove typescript @types/async-retry @types/bn.js ts-node @solendprotocol/solend-sdk @hover-labs/kolibri-js
 
           # fail if package.json or package-lock.json is changed
-          FILES_MODIFIED=${{ steps.file_changes.outputs.files_modified }}
-          if [[ $FILES_MODIFIED == *"package.json"* || $FILES_MODIFIED == *"package-lock.json"* || $FILES_MODIFIED == *"pnpm-lock.yaml"* || $FILES_MODIFIED == *"pnpm-workspace.yaml"* ]]; then
+          if [[ "$FILES_MODIFIED" == *"package.json"* || "$FILES_MODIFIED" == *"package-lock.json"* || "$FILES_MODIFIED" == *"pnpm-lock.yaml"* || "$FILES_MODIFIED" == *"pnpm-workspace.yaml"* ]]; then
             echo "------ ERROR ------ > Please revert changes to package.json / package-lock.json / pnpm-lock.yaml / pnpm-workspace.yaml" > ${{ github.workspace }}/output.txt
             node ${{ github.workspace }}/.github/workflows/commentResult.js ${{ github.workspace }}/output.txt ${{ github.workspace }}/pr-comments
             exit 1
           fi
 
           # fail if any newly-added lines use api.getLogs(...) — adapters must use the getLogs2 helper instead
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-          OFFENDERS=$(git diff "$BASE_SHA" "$HEAD_SHA" -- 'projects/**/*.js' \
+          OFFENDERS=$(git diff "$PR_BASE_SHA" "$PR_HEAD_SHA" -- 'projects/**/*.js' \
             | grep -nE '^\+[^+].*\bapi\.getLogs\s*\(' || true)
           if [ -n "$OFFENDERS" ]; then
             {
@@ -75,23 +90,27 @@ jobs:
             exit 1
           fi
 
-          for i in $(echo $RUN_FILES | tr  -d '"[]' | tr "," "\n")
-          do
+          # Parse the JSON array with Node into newline-separated entries so the
+          # loop never word-splits or glob-expands attacker-controlled paths.
+          RUN_FILES_NL=$(node -e 'const fs = require("fs"); const items = JSON.parse(fs.readFileSync(0, "utf8")); process.stdout.write(items.join("\n"));' <<< "$RUN_FILES")
+
+          while IFS= read -r i; do
+            [ -z "$i" ] && continue
             {
-              node ${{ github.workspace }}/test.js ${{ github.workspace }}/${i} 2>&1 | tee output.txt
-              node ${{ github.workspace }}/.github/workflows/commentResult.js ${{ github.workspace }}/output.txt ${{ github.workspace }}/pr-comments ${i}
+              node ${{ github.workspace }}/test.js ${{ github.workspace }}/"$i" 2>&1 | tee output.txt
+              node ${{ github.workspace }}/.github/workflows/commentResult.js ${{ github.workspace }}/output.txt ${{ github.workspace }}/pr-comments "$i"
               if grep -q "\-\-\-\- ERROR \-\-\-\-" output.txt; then
                 exit 1;
               fi
             } || {
-              echo -n $i
+              echo -n "$i"
               echo ' doesnt run'
             }
-          done
+          done <<< "$RUN_FILES_NL"
 
       - name: Upload PR comments artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pr-comments
           path: pr-comments/
